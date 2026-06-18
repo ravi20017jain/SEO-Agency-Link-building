@@ -37,7 +37,7 @@ FIRST_NAME  = "Ray"
 LAST_NAME   = ""
 FULL_NAME   = "Ray"
 COMPANY     = "Zevahit"
-EMAIL       = "ray@zevahit.com"
+EMAIL       = "sales@zevahit.com"
 PHONE       = "+18005550199" # Agar zaroorat ho toh apna real phone number dalein
 
 SUBJECT_TEMPLATE = "Quick question regarding white-label link inventory"
