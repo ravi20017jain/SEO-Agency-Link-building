@@ -1,0 +1,5 @@
+google-generativeai>=0.8.0
+gspread>=6.1.0
+google-auth>=2.29.0
+playwright>=1.43.0
+2captcha-python>=1.2.4
