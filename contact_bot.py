@@ -314,14 +314,22 @@ Example good output: Saw you've been doing some impressive SEO work for e-commer
 
     prompt = prompt.format(website=website, site_text=site_text)
     raw = None
-    
-    try:
-        resp = gemini_model.generate_content(prompt)
-        raw = (resp.text or "").strip()
-    except Exception as e:
-        log.warning("  [Personalize] failed: {}".format(str(e)[:60]))
-        return ""
 
+    waits = [15, 30, 60]
+    for attempt in range(3):
+        try:
+            resp = gemini_model.generate_content(prompt)
+            raw = (resp.text or "").strip()
+            break
+        except Exception as e:
+            msg = str(e)
+            if any(c in msg for c in ("429", "quota", "rate", "exceeded", "503", "overloaded")):
+                w = waits[attempt]
+                log.warning("  [Personalize] rate limit, retry in {}s...".format(w))
+                time.sleep(w)
+                continue
+            log.warning("  [Personalize] failed: {}".format(msg[:60]))
+            return ""
     if not raw:
         return ""
 
@@ -342,17 +350,51 @@ def get_page_html(page):
     except Exception:
         return ""
 
-def ask_claude(page, website, subject, message):
+def ask_claude(page, website, subject, message_template, homepage_text=""):
+    """
+    MERGED single Gemini call:
+    - homepage_text (homepage se capture kiya) se personalized opening line banata hai
+    - Us line ko message_template ke {intro} me daalta hai
+    - Phir contact page ke form HTML se form-fill actions banata hai
+    Sab kuch EK hi Gemini call me -> quota aadhi.
+    Personalization homepage text se (strong), form-fill contact page se (sahi).
+
+    Returns: (actions_list, intro_line)
+    """
     try:
         page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         pass
-        
-    page_html = get_page_html(page)[:18000]
 
-    prompt = """You are a web automation expert. Fill this contact form on: {website}
+    page_html = get_page_html(page)[:16000]
+    # Personalization homepage text se. Agar homepage text na mile to current page se fallback.
+    site_text = (homepage_text or "").strip()
+    if len(site_text) < 40:
+        site_text = get_page_text(page)
+    site_text = site_text[:2500]
 
-Form HTML:
+    prompt = """You are a web automation expert AND a cold-outreach copywriter. Do BOTH tasks below for the site: {website}
+
+=== TASK 1: Write a personalized opening line ===
+Here is visible text scraped from their HOMEPAGE (this describes what the business actually does):
+---
+{site_text}
+---
+Write ONE short, specific, genuine opening line (max 22 words) that shows we actually looked at their site.
+Rules for the line:
+- Mention something REAL and specific about what this B2B brand does: their product category, who they serve, or a specific value prop you can see in the text.
+- Sound human and sharp, NOT salesy or generic. No "I hope this finds you well".
+- Do NOT mention SEO, links, AI search, rankings, or any offer.
+- End with a comma or dash so the next sentence flows naturally.
+- If the text is too thin to say anything specific, use an empty string "" for the line.
+
+=== TASK 2: Fill the contact form ===
+Take this MESSAGE TEMPLATE and replace the literal token {{INTRO}} with your line from Task 1 (followed by two newlines). If your line is empty, just remove the {{INTRO}} token.
+
+MESSAGE TEMPLATE:
+{message_template}
+
+Now fill this contact form. Form HTML:
 {html}
 
 Details to fill:
@@ -363,31 +405,61 @@ Details to fill:
 - Email: {email}
 - Phone: {phone}
 - Subject/Title: {subject}
-- Message (copy EXACTLY, keep all line breaks):
-{message}
+- Message: use the FINAL message (template with {{INTRO}} replaced). Copy it EXACTLY, keep all line breaks.
 
-Return ONLY a JSON array of actions. Each action:
-  "action": "fill" | "check" | "click" | "select"
-  "selector": CSS selector
-  "value": value to use
-
-Return ONLY valid JSON array. No markdown, no text.""".format(
-        website=website, html=page_html, full_name=FULL_NAME, first_name=FIRST_NAME,
-        last_name=LAST_NAME, company=COMPANY, email=EMAIL, phone=PHONE,
-        subject=subject, message=message
+=== OUTPUT FORMAT ===
+Return ONLY a valid JSON object (no markdown, no extra text) with EXACTLY these two keys:
+{{
+  "intro_line": "the line you wrote in Task 1 (or empty string)",
+  "actions": [
+    {{"action": "fill"|"check"|"click"|"select", "selector": "CSS selector", "value": "value to use"}}
+  ]
+}}
+""".format(
+        website=website, site_text=site_text, html=page_html,
+        message_template=message_template.replace("{intro}", "{INTRO}"),
+        full_name=FULL_NAME, first_name=FIRST_NAME, last_name=LAST_NAME,
+        company=COMPANY, email=EMAIL, phone=PHONE, subject=subject
     )
 
-    try:
-        resp = gemini_model.generate_content(prompt)
-        raw = resp.text.strip()
-    except Exception as e:
-        raise Exception(f"Gemini API generation failed: {e}")
+    raw = None
+    waits = [15, 30, 60]
+    for attempt in range(3):
+        try:
+            resp = gemini_model.generate_content(prompt)
+            raw = resp.text.strip()
+            break
+        except Exception as e:
+            msg = str(e)
+            if any(c in msg for c in ("429", "quota", "rate", "exceeded", "503", "overloaded")):
+                w = waits[attempt]
+                log.warning("  [AI] rate limit, retry in {}s... ({})".format(w, msg[:40]))
+                time.sleep(w)
+                continue
+            raise Exception(f"Gemini API generation failed: {e}")
+    if raw is None:
+        raise Exception("Gemini API failed after retries (likely daily quota exhausted)")
 
+    # Clean markdown fences
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    return json.loads(raw.strip())
+    raw = raw.strip()
+
+    data = json.loads(raw)
+
+    # Backward-safe: agar kabhi AI sirf array bhej de to use actions maan lo
+    if isinstance(data, list):
+        return data, ""
+
+    actions = data.get("actions", [])
+    intro_line = (data.get("intro_line") or "").strip()
+    if intro_line:
+        log.info("  [Personalize] {}".format(intro_line[:80]))
+    return actions, intro_line
+
+
 
 # ------------------------------------------
 #  EXECUTE ACTIONS
@@ -492,21 +564,22 @@ def main():
                 time.sleep(2)
                 dismiss_cookie_banner(pg)
 
-                try:
-                    intro_line = generate_personalized_line(pg, website)
-                except Exception:
-                    intro_line = ""
-                
-                intro_block = (intro_line.strip() + "\n\n") if intro_line.strip() else ""
-                current_message = MESSAGE_TEMPLATE.format(intro=intro_block)
+                # Homepage ka business text ABHI capture karo (contact page jaane se PEHLE).
+                # Yahi text personalization ke liye strong hai - business kya karta hai
+                # ye homepage pe hota hai, contact page pe nahi.
+                homepage_text = get_page_text(pg)
 
                 find_contact_page(pg, website)
                 time.sleep(1)
                 dismiss_cookie_banner(pg)
                 solve_captcha(pg, website)
 
+                # MERGED single Gemini call: personalize line (homepage text se)
+                # + form actions (contact page HTML se) ek saath. Sirf 1 call = quota aadhi.
                 try:
-                    actions = ask_claude(pg, website, current_subject, current_message)
+                    actions, intro_line = ask_claude(
+                        pg, website, current_subject, MESSAGE_TEMPLATE, homepage_text
+                    )
                 except Exception as e:
                     update_sheet_row(ws, row_idx, "error", "AI error: {}".format(str(e)[:80]))
                     continue
@@ -527,6 +600,12 @@ def main():
                     ai_actions=str(len(actions))
                 )
 
+                # ---- Gemini 429 Rate Limit fix ----
+                # Har site pe 2 Gemini call jaati hain (personalize + form-fill).
+                # Free tier 15 req/min ko cross na karne ke liye har site ke baad wait.
+                log.info("  Waiting 15s to avoid Gemini rate limit...")
+                time.sleep(15)
+
             except Exception as e:
                 log.error("  ERROR: {}".format(str(e)[:100]))
                 
@@ -537,6 +616,8 @@ def main():
                     pass
                 
                 update_sheet_row(ws, row_idx, "error", str(e)[:100])
+                # Error aane par bhi thoda zyada wait (kabhi-kabhi 429 hi crash karta hai)
+                time.sleep(10)
 
         browser.close()
     log.info("\nRun complete!")
