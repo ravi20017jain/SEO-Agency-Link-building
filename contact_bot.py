@@ -14,6 +14,10 @@ FIXES vs previous version:
   FIX 5: Iframe form detection + frame context switching
   FIX 6: Label-based fallback fill for unlabelled inputs
   FIX 7: WPForms / CF7 / GravityForms / Elementor specific success class detection
+  FIX 8: contact page nav wait 0.5s -> 2s + networkidle wait
+  FIX 9: form load wait before get_page_html (wait_for_selector + networkidle)
+  FIX 10: debug screenshot + HTML dump before AI call
+  FIX 11: Gemini prompt gets generic visible input fallback selectors rule
 """
 import os
 import json
@@ -64,6 +68,9 @@ Client reviews: https://clutch.co/profile/zevahit#reviews"""
 
 PROCESS_LIMIT = None
 
+# FIX 10: Debug mode — set False in production to skip HTML/screenshot dumps
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+
 CONTACT_KEYWORDS = [
     "contact", "contact-us", "contactus", "contact-form", "get-in-touch",
     "getintouch", "reach-us", "reachus", "reach-out", "write-to-us",
@@ -81,7 +88,6 @@ CONTACT_KEYWORDS = [
 #  SUCCESS DETECTION CONSTANTS
 # ------------------------------------------
 
-# Text phrases that indicate successful submission
 SUCCESS_PHRASES = [
     "thank you", "thanks", "thank-you",
     "message sent", "message received", "message has been sent",
@@ -97,23 +103,14 @@ SUCCESS_PHRASES = [
     "we have received", "has been received",
 ]
 
-# CSS classes that WP form plugins add on success (no page reload needed)
 SUCCESS_CSS_CLASSES = [
-    # WPForms
     "wpforms-confirmation", "wpforms-confirmation-container",
-    # Contact Form 7
     "wpcf7-mail-sent-ok",
-    # Gravity Forms
     "gform_confirmation_wrapper", "gform_confirmation_message",
-    # Elementor Forms
     "elementor-message-success",
-    # Ninja Forms
     "nf-response-msg",
-    # Formidable Forms
     "frm_message",
-    # HubSpot
     "submitted-message",
-    # Generic
     "alert-success", "form-success", "message-success",
     "success-message", "sent-message", "contact-success",
     "form-sent", "is-success", "success-box",
@@ -260,7 +257,14 @@ def find_contact_page(page, base_url):
                         page.wait_for_load_state("domcontentloaded", timeout=10000)
                     except Exception:
                         pass
-                    time.sleep(0.5)
+
+                    # FIX 8: Extended wait after contact page navigation
+                    time.sleep(2)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+
                     return True
             except Exception:
                 pass
@@ -277,6 +281,12 @@ def find_contact_page(page, base_url):
             title = page.title().lower()
             if resp and resp.status < 400 and "404" not in title and "not found" not in title:
                 log.info("  Contact page: {}".format(candidate))
+                # FIX 8: Extended wait here too
+                time.sleep(2)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
                 return True
         except Exception:
             pass
@@ -324,26 +334,16 @@ def solve_captcha(page, website):
     return False
 
 # ------------------------------------------
-#  SUCCESS DETECTION  (FIX 2 + FIX 7)
+#  SUCCESS DETECTION
 # ------------------------------------------
 
 def check_submission_success(page, url_before):
-    """
-    Multi-signal success check:
-    1. URL changed (redirect after submit)
-    2. URL fragment changed (e.g. #thank-you anchor)
-    3. Any SUCCESS_PHRASES found in body text
-    4. Any SUCCESS_CSS_CLASSES found as visible element
-    5. All <form> elements disappeared from page (AJAX hide)
-    """
     try:
         current_url = page.url
 
-        # Signal 1: URL changed (hard redirect)
         if current_url != url_before:
             return True
 
-        # Signal 2: URL fragment changed (e.g. scrolled to #thank-you)
         if "#" in current_url and current_url.split("#")[0] == url_before.split("#")[0]:
             frag = current_url.split("#")[-1].lower()
             if any(w in frag for w in ["thank", "success", "confirm", "sent", "done"]):
@@ -355,11 +355,9 @@ def check_submission_success(page, url_before):
         except Exception:
             pass
 
-        # Signal 3: Success phrase in body text
         if any(phrase in body_text for phrase in SUCCESS_PHRASES):
             return True
 
-        # Signal 4: Success CSS class visible on page
         for css_class in SUCCESS_CSS_CLASSES:
             try:
                 el = page.locator(".{}".format(css_class)).first
@@ -369,7 +367,6 @@ def check_submission_success(page, url_before):
             except Exception:
                 pass
 
-        # Signal 5: Form elements disappeared (AJAX hide after submit)
         try:
             forms = page.locator("form").all()
             if forms:
@@ -387,15 +384,10 @@ def check_submission_success(page, url_before):
     return False
 
 # ------------------------------------------
-#  IFRAME FORM DETECTION  (FIX 5)
+#  IFRAME FORM DETECTION
 # ------------------------------------------
 
 def try_iframe_form(page, actions):
-    """
-    Detects forms embedded in iframes (JotForm, Typeform, Cognito, etc.)
-    Switches frame context and retries fill actions there.
-    Returns (filled, submitted) or ([], False) if no iframe form.
-    """
     iframe_selectors = [
         'iframe[src*="jotform"]',
         'iframe[src*="typeform"]',
@@ -447,14 +439,10 @@ def try_iframe_form(page, actions):
     return [], False
 
 # ------------------------------------------
-#  LABEL-BASED FALLBACK FILL  (FIX 6)
+#  LABEL-BASED FALLBACK FILL
 # ------------------------------------------
 
 def label_based_fill(page, field_type, value):
-    """
-    When selector-based fill fails, try finding input by its <label> text.
-    field_type: 'name' | 'email' | 'phone' | 'company' | 'subject' | 'message'
-    """
     label_map = {
         "name":    ["name", "full name", "your name", "contact name", "first name"],
         "email":   ["email", "e-mail", "email address", "your email"],
@@ -475,17 +463,11 @@ def label_based_fill(page, field_type, value):
                 label_text = (label.inner_text(timeout=300) or "").strip().lower()
                 if not any(kw in label_text for kw in keywords):
                     continue
-                # Try for= attribute
                 for_attr = label.get_attribute("for") or ""
                 if for_attr:
                     el = page.query_selector("#{}".format(for_attr))
                     if el:
-                        tag = (el.get_attribute("tagName") or el.evaluate(
-                            "el => el.tagName")).lower()
-                        if tag == "textarea":
-                            page.locator("#{}".format(for_attr)).fill(value, timeout=2000)
-                        else:
-                            page.locator("#{}".format(for_attr)).fill(value, timeout=2000)
+                        page.locator("#{}".format(for_attr)).fill(value, timeout=2000)
                         return True
             except Exception:
                 pass
@@ -494,14 +476,10 @@ def label_based_fill(page, field_type, value):
     return False
 
 # ------------------------------------------
-#  SMART JS FILL  (FIX 1)
+#  SMART JS FILL
 # ------------------------------------------
 
 def smart_js_fill(page, selector, value):
-    """
-    Correct JS fill fallback using query_selector (element handle),
-    NOT locator. Element handles ARE serializable, locators are NOT.
-    """
     try:
         el = page.query_selector(selector)
         if not el:
@@ -514,7 +492,6 @@ def smart_js_fill(page, selector, value):
             el.dispatchEvent(new Event('change', {bubbles: true}));
             el.dispatchEvent(new Event('blur',   {bubbles: true}));
         }""", el, value)
-        # Verify fill worked
         filled_val = page.evaluate("el => el.value", el)
         return bool(filled_val)
     except Exception:
@@ -546,29 +523,35 @@ def get_page_text(page):
 
 
 def get_page_html(page):
-    """
-    Extracts form-relevant HTML only. Adds label text next to inputs
-    so Gemini can use labels as selector hints (FIX 4 support).
-    """
+    # FIX 9: Wait for form elements to be present before extracting HTML
+    try:
+        page.wait_for_selector(
+            "form, input[type='text'], input[type='email'], textarea",
+            timeout=8000
+        )
+    except Exception:
+        log.warning("  [HTML] No form/input found within timeout — extracting anyway")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=6000)
+    except Exception:
+        pass
+
     try:
         return page.evaluate("""() => {
             const els = document.querySelectorAll(
                 'input, textarea, button, select, label, form, [class*="form"], [id*="form"]'
             );
             return Array.from(els).map(el => {
-                // For inputs: also grab nearby label text
                 let extra = '';
                 if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                    // Try label[for=id]
                     if (el.id) {
                         const lbl = document.querySelector('label[for="' + el.id + '"]');
                         if (lbl) extra = ' data-label="' + lbl.innerText.trim() + '"';
                     }
-                    // Try aria-label
                     if (!extra && el.getAttribute('aria-label')) {
                         extra = ' data-label="' + el.getAttribute('aria-label') + '"';
                     }
-                    // Try placeholder
                     if (!extra && el.placeholder) {
                         extra = ' data-label="' + el.placeholder + '"';
                     }
@@ -580,20 +563,32 @@ def get_page_html(page):
         return ""
 
 # ------------------------------------------
-#  AI: MERGED PERSONALIZE + FORM FILL  (FIX 4)
+#  DEBUG DUMP  (FIX 10)
+# ------------------------------------------
+
+def debug_dump(page, row_idx):
+    """Save screenshot + HTML for debugging no_form_found cases."""
+    if not DEBUG_MODE:
+        return
+    try:
+        os.makedirs("screenshots/debug", exist_ok=True)
+        pg_url = page.url
+        pg_html = get_page_html(page)
+        shot_path = "screenshots/debug/before_ai_{}.png".format(row_idx)
+        html_path = "screenshots/debug/html_{}.txt".format(row_idx)
+        page.screenshot(path=shot_path)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("URL: {}\n\n".format(pg_url))
+            f.write(pg_html)
+        log.info("  [Debug] Saved: {} | {}".format(shot_path, html_path))
+    except Exception as e:
+        log.warning("  [Debug] dump failed: {}".format(str(e)[:60]))
+
+# ------------------------------------------
+#  AI: MERGED PERSONALIZE + FORM FILL
 # ------------------------------------------
 
 def ask_claude(page, website, subject, message_template, homepage_text=""):
-    """
-    Single Gemini call: personalize line + form actions.
-    FIX 4: Prompt now explicitly warns against dynamic/numeric IDs
-    and gives GravityForms / CF7 / WPForms correct selectors.
-    """
-    try:
-        page.wait_for_load_state("networkidle", timeout=5000)
-    except Exception:
-        pass
-
     page_html  = get_page_html(page)
     site_text  = (homepage_text or "").strip()
     if len(site_text) < 40:
@@ -644,6 +639,12 @@ Fill details:
 7. Skip any field whose data-label contains: date, time, day, month, year, appointment, calendar.
 8. Skip checkbox/radio/select fields unless they look like consent or service choice.
 9. If you see NO proper form fields, return an empty actions array [].
+10. If labeled selectors fail, use these visible generic fallbacks IN ORDER:
+    - Name: input[type="text"]:visible:first-of-type
+    - Email: input[type="email"]:visible
+    - Phone: input[type="tel"]:visible
+    - Message: textarea:visible
+    - Submit: button[type="submit"]:visible, input[type="submit"]:visible
 
 === OUTPUT FORMAT ===
 Return ONLY valid JSON (no markdown, no extra text):
@@ -678,7 +679,6 @@ Return ONLY valid JSON (no markdown, no extra text):
     if raw is None:
         raise Exception("Gemini API failed after retries (daily quota exhausted)")
 
-    # Strip markdown fences
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -696,7 +696,7 @@ Return ONLY valid JSON (no markdown, no extra text):
     return actions, intro_line
 
 # ------------------------------------------
-#  EXECUTE ACTIONS  (FIX 1 + FIX 2 + FIX 3)
+#  EXECUTE ACTIONS
 # ------------------------------------------
 
 def execute_actions(page, actions):
@@ -711,7 +711,6 @@ def execute_actions(page, actions):
         if not selector:
             continue
 
-        # ---- FILL ----
         if act == "fill":
             try:
                 locator = page.locator(selector).first
@@ -720,7 +719,6 @@ def execute_actions(page, actions):
                 except Exception:
                     pass
 
-                # Method 1: Playwright native fill (best)
                 filled_ok = False
                 try:
                     locator.fill(value, timeout=3000)
@@ -728,11 +726,9 @@ def execute_actions(page, actions):
                 except Exception:
                     pass
 
-                # Method 2: JS fill with element handle (FIX 1 - NOT locator)
                 if not filled_ok:
                     filled_ok = smart_js_fill(page, selector, value)
 
-                # Method 3: Type character by character (for React/Vue inputs)
                 if not filled_ok:
                     try:
                         locator.click(timeout=2000)
@@ -749,12 +745,10 @@ def execute_actions(page, actions):
             except Exception as e:
                 log.warning("  [--] fill: {} -> {}".format(selector[:50], str(e)[:40]))
 
-        # ---- CLICK (submit button) ----
         elif act == "click":
             url_before = page.url
             click_ok   = False
 
-            # Method 1: Playwright locator click
             try:
                 locator = page.locator(selector).first
                 try:
@@ -766,11 +760,9 @@ def execute_actions(page, actions):
             except Exception as e1:
                 log.warning("  [--] click: {} -> {}".format(selector[:50], str(e1)[:40]))
 
-            # Method 2: JS click via element handle (FIX 3 - NOT page.evaluate with locator)
-            # Only try if locator click failed AND page hasn't navigated (no context destroy)
             if not click_ok:
                 try:
-                    if page.url == url_before:           # still same page = safe to JS click
+                    if page.url == url_before:
                         el = page.query_selector(selector)
                         if el:
                             page.evaluate("el => el.click()", el)
@@ -778,7 +770,6 @@ def execute_actions(page, actions):
                 except Exception as e2:
                     log.warning("  [--] js-click: {} -> {}".format(selector[:50], str(e2)[:40]))
 
-            # Method 3: Keyboard Enter on the element
             if not click_ok:
                 try:
                     locator = page.locator(selector).first
@@ -788,7 +779,6 @@ def execute_actions(page, actions):
                 except Exception:
                     pass
 
-            # Success detection: 8 polls × 3s = 24s max  (FIX 2)
             for poll in range(8):
                 time.sleep(3)
                 if check_submission_success(page, url_before):
@@ -799,7 +789,6 @@ def execute_actions(page, actions):
             if not submitted:
                 log.warning("  [??] clicked but NO confirmation.")
 
-        # ---- CHECK (checkbox) ----
         elif act == "check":
             try:
                 locator = page.locator(selector).first
@@ -807,7 +796,6 @@ def execute_actions(page, actions):
             except Exception as e:
                 log.warning("  [--] check: {} -> {}".format(selector[:50], str(e)[:30]))
 
-        # ---- SELECT (dropdown) ----
         elif act == "select":
             try:
                 locator = page.locator(selector).first
@@ -815,7 +803,6 @@ def execute_actions(page, actions):
             except Exception as e:
                 log.warning("  [--] select: {} -> {}".format(selector[:50], str(e)[:30]))
 
-        # Stop further actions after successful submission
         if submitted:
             break
 
@@ -867,7 +854,6 @@ def main():
                 time.sleep(2)
                 dismiss_cookie_banner(pg)
 
-                # Capture homepage text BEFORE navigating to contact page
                 homepage_text = get_page_text(pg)
 
                 find_contact_page(pg, website)
@@ -875,7 +861,9 @@ def main():
                 dismiss_cookie_banner(pg)
                 solve_captcha(pg, website)
 
-                # Single Gemini call: personalize + form actions
+                # FIX 10: Debug dump before AI call
+                debug_dump(pg, row_idx)
+
                 try:
                     actions, intro_line = ask_claude(
                         pg, website, current_subject, MESSAGE_TEMPLATE, homepage_text
@@ -886,15 +874,12 @@ def main():
                     time.sleep(10)
                     continue
 
-                # Try normal page form execution
                 filled, submitted = execute_actions(pg, actions)
 
-                # If normal execution found no form, try iframe-embedded forms (FIX 5)
                 if not filled and not submitted:
                     log.info("  [Iframe] Trying iframe form fallback...")
                     filled, submitted = try_iframe_form(pg, actions)
 
-                # Determine status
                 if submitted:
                     status, note_text = "submitted", "OK"
                 elif not filled:
